@@ -1,0 +1,175 @@
+name: Infrastructure workflow
+on:
+  workflow_dispatch:
+    inputs:
+      force_apply:
+        type: boolean
+        required: false
+        description: Force apply of the infrastructure, normally changes are not being applied if not on 'main' or 'master' branch
+  push:
+    branches:
+      - "**"
+
+env:
+  TF_DIRECTORY: ./infra
+  TF_VERSION: 1.9.7
+  PG_CONN_STR: ${{ secrets.TF_BACKEND_PG_CONN_STR }}
+  # SendGrid
+  TF_VAR_SENDGRID_API_KEY: ${{ secrets.TF_VAR_SENDGRID_API_KEY || '[null]' }}
+  # Auth0
+  TF_VAR_AUTH0_DOMAIN: ${{ vars.TF_VAR_AUTH0_DOMAIN || '[null]' }}
+  TF_VAR_AUTH0_CLIENT_ID: ${{ secrets.TF_VAR_AUTH0_CLIENT_ID || '[null]' }}
+  TF_VAR_AUTH0_CLIENT_SECRET: ${{ secrets.TF_VAR_AUTH0_CLIENT_SECRET || '[null]' }}
+
+jobs:
+  tf_plan:
+    runs-on: ubuntu-latest
+    if: ${{ vars.TF_ENABLED == 'true' || github.event_name == 'workflow_dispatch' }}
+    permissions:
+      pull-requests: write
+      contents: read
+      issues: read
+    defaults:
+      run:
+        working-directory: ${{ env.TF_DIRECTORY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: fmt
+        id: fmt
+        run: terraform fmt -check --diff --write=false
+        continue-on-error: false
+
+      - name: Init
+        id: init
+        run: terraform init -input=false -upgrade
+
+      - name: Validate
+        id: validate
+        run: terraform validate -no-color
+
+      - name: Plan (SendGrid)
+        id: plan-sendgrid
+        run: terraform plan -no-color -input=false -target=module.sendgrid -out=tfplan-sendgrid
+        continue-on-error: false
+
+      - name: Apply (SendGrid)
+        id: apply-sendgrid
+        run: terraform apply -no-color -auto-approve -input=false tfplan-sendgrid
+        continue-on-error: false
+
+      - name: Plan (All)
+        id: plan
+        run: terraform plan -no-color -input=false -out=tfplan-all
+        continue-on-error: false
+
+      - name: Diff as Pull Request comment
+        uses: actions/github-script@v7
+        env:
+          APPLIED: "auto-applied:\n${{ steps.plan-sendgrid.outputs.stdout }}"
+          PLAN: "terraform:\n${{ steps.plan.outputs.stdout }}"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // 1. Prepare format of the comment
+            const output = `#### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+            #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+            #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
+            <details><summary>Validation Output</summary>
+            
+            \`\`\`\n
+            ${{ steps.validate.outputs.stdout }}
+            \`\`\`
+            
+            </details>
+            
+            #### Terraform mandatory applies 📌\`${{ steps.plan-sendgrid.outcome }}\`
+
+            <details><summary>Show Applied</summary>
+            
+            \`\`\`\n
+            ${process.env.APPLIED.length > 5000 ? process.env.APPLIED.substring(0, 5000) : process.env.APPLIED}
+            \`\`\`
+            
+            </details>
+
+            #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+            
+            <details><summary>Show Plan</summary>
+            
+            \`\`\`\n
+            ${process.env.PLAN.length > 62000 ? process.env.PLAN.substring(0, 62000) : process.env.PLAN}
+            \`\`\`
+            
+            </details>
+
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Working Directory: \`${{ env.TF_DIRECTORY }}\`, Workflow: \`${{ github.workflow }}\`*`;
+            
+            // 2. Find the issue
+            const issues = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              head: `${context.repo.owner}:${context.ref.replace('refs/heads/', '')}`
+            })
+            const pr = context?.issue?.number || issues?.data[0]?.number
+            if (!pr) {
+              console.log(output)
+              return
+            }
+            
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr,
+            })
+            const botComment = comments.find(comment => {
+              return comment.user.type === 'Bot' && comment.body.includes('Terraform Format and Style')
+            })
+            
+            // 3. If we have a comment, update it, otherwise create a new one
+            if (botComment) {
+              github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: output
+              })
+            } else {
+              github.rest.issues.createComment({
+                issue_number: pr,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: output
+              })
+            }
+
+  tf_apply:
+    runs-on: ubuntu-latest
+    needs: [tf_plan]
+    if: ${{ (vars.TF_ENABLED == 'true' || github.event_type == 'workflow_dispatch') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.event.inputs.force_apply) }}
+    defaults:
+      run:
+        working-directory: ${{ env.TF_DIRECTORY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Init
+        id: init
+        run: terraform init -input=false -upgrade
+
+      - name: Apply
+        id: apply
+        run: terraform apply -no-color -auto-approve -input=false
